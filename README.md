@@ -1,223 +1,251 @@
-# Orchestra
+# Orchai
 
-Orchestra is a small TypeScript prototype for learning how an agent workflow is coordinated.
+Orchai is a TypeScript CLI for coordinating coding agents. Give it a prompt and it can plan the work, run Claude CLI workers, review the result, and save a JSON log of the whole run.
 
-The current workflow is:
+It has three useful modes:
 
-```txt
-prompt
-  -> planner creates tasks
-  -> builder/worker changes files
-  -> reviewer checks files
-  -> logger saves a JSON run record
-  -> terminal prints a summary
-```
+- **Generated project mode** creates a fresh project in a new folder. This is the default and is safest for experimenting.
+- **Existing repo mode** points a Claude worker at a repo you choose.
+- **Parallel mode** splits independent work across multiple Claude workers using separate git worktrees.
 
-The tool source directory should stay source-only. Generated projects, existing repo edits, and run logs must be written outside the Orchestra source repo.
+The codebase still uses `ORCHESTRA_*` environment variables internally.
+
+## Requirements
+
+- Node.js 18 or newer
+- Git, if you work in an existing repo or use parallel mode
+- Claude CLI, installed and logged in, for existing repo mode, parallel mode, or `ORCHESTRA_PLANNER=claude`
+
+You can try the default generated project mode without Claude because it uses the deterministic planner and template builder.
 
 ## Install
 
 ```bash
+git clone https://github.com/samhcarrasco/Orchai.git
+cd Orchai
 npm install
-```
-
-## Run
-
-Generated project mode is the default:
-
-```bash
-npm run dev -- "Build a simple todo app"
-```
-
-Expected terminal output looks like:
-
-```txt
-Run complete
-Run ID: run_...
-Planner: deterministic
-Workspace: generated-project
-Prompt: Build a simple todo app
-Project path: C:\Users\...\Desktop\Orchestra Projects\simple-todo-app
-Tasks: 3
-Files changed: 3
-Review passed: true
-Log path: C:\Users\...\Documents\Orchestra\runs\run_....json
-```
-
-Generated projects are never written into the Orchestra source repo. By default they are written to your Desktop:
-
-```txt
-C:\Users\<you>\Desktop\Orchestra Projects\
-```
-
-You can choose a different external folder:
-
-```powershell
-$env:ORCHESTRA_GENERATED_ROOT = "C:\Users\shcar\Desktop\My Orchestra Projects"
-npm run dev -- "Build a simple todo app"
-```
-
-`ORCHESTRA_GENERATED_ROOT` must be outside the Orchestra source repo.
-
-## Planner Mode
-
-By default, Orchestra uses the deterministic planner. That keeps local test runs predictable.
-
-To use the local Claude CLI as the planner in PowerShell:
-
-```powershell
-$env:ORCHESTRA_PLANNER = "claude"
-npm run dev -- "Build a simple todo app"
-```
-
-To switch back:
-
-```powershell
-$env:ORCHESTRA_PLANNER = "deterministic"
-```
-
-Claude mode uses the `claude` command already installed and logged in on the machine. You can override the command path with:
-
-```powershell
-$env:ORCHESTRA_CLAUDE_COMMAND = "C:\path\to\claude.exe"
-```
-
-Optional model tiers can be configured without hardcoding model names in Orchestra:
-
-```powershell
-$env:ORCHESTRA_PLANNER_MODEL = "haiku"
-$env:ORCHESTRA_WORKER_MODEL = "sonnet"
-$env:ORCHESTRA_CONFLICT_RESOLVER_MODEL = "opus"
-```
-
-These values are passed to Claude CLI as `--model` only when the environment variables are set.
-
-## Existing Repo Mode
-
-Orchestra can also target an existing git repo. This uses the same orchestration loop, but the workspace is the repo you choose instead of the generated projects folder.
-
-PowerShell example:
-
-```powershell
-$env:ORCHESTRA_WORKSPACE_PATH = "C:\path\to\your\repo"
-$env:ORCHESTRA_REVIEW_COMMAND = "npm run mr-check"
-npm run dev -- "Add the requested feature"
-```
-
-Existing repo mode currently uses Claude as the workspace worker because the simple template builder is only appropriate for generated projects. The planner can still be deterministic, or you can opt into Claude planning too:
-
-```powershell
-$env:ORCHESTRA_PLANNER = "claude"
-```
-
-Safety rules in this first version:
-
-- `ORCHESTRA_WORKSPACE_PATH` must point to a git repo.
-- `ORCHESTRA_WORKSPACE_PATH` must be outside the Orchestra source repo.
-- The Claude worker runs inside that repo.
-- Orchestra refuses to work on a dirty repo by default.
-- Set `$env:ORCHESTRA_ALLOW_DIRTY_REPO = "1"` only when you intentionally want to allow existing uncommitted changes.
-- The run log records git status before and after the worker.
-- `ORCHESTRA_REVIEW_COMMAND` is repo-specific and runs inside the selected repo after file changes.
-
-Different repos can use different review commands:
-
-```powershell
-$env:ORCHESTRA_REVIEW_COMMAND = "npm run mr-check"
-$env:ORCHESTRA_REVIEW_COMMAND = "npm test"
-$env:ORCHESTRA_REVIEW_COMMAND = "pnpm lint"
-```
-
-If no review command is set, Orchestra still reviews changed files, but it does not run repo-specific tests or checks.
-
-To return to generated project mode:
-
-```powershell
-Remove-Item Env:ORCHESTRA_WORKSPACE_PATH
-Remove-Item Env:ORCHESTRA_REVIEW_COMMAND
-$env:ORCHESTRA_PLANNER = "deterministic"
-```
-
-## Parallel Mode
-
-Parallel mode uses a cheap scout/planner decision before any worker terminals start. The planner chooses `single_worker`, `parallel`, or `blocked`; small or tightly related requests run as one worker, and multiple workers are only started for meaningfully independent work.
-
-```powershell
-$env:ORCHESTRA_PLANNER = "claude"
-$env:ORCHESTRA_WORKSPACE_PATH = "C:\path\to\your\repo"
-npm run dev -- --parallel "Make the requested batch of changes"
-```
-
-The planner also produces a compact brief that is passed into worker prompts so each worker has useful context without rediscovering everything from scratch.
-
-## Typecheck
-
-```bash
 npm run typecheck
 ```
 
-## Where Files Are Saved
+## Quick Start
 
-Generated projects are saved outside the Orchestra source repo.
+Run the commands below from the Orchai source directory, the folder that contains `package.json`. If you just installed Orchai, that is the folder you entered with `cd Orchai`.
 
-Default:
+Set the environment values first. This block includes every `ORCHESTRA_*` setup variable, with the values you can use and what each one changes.
+
+```powershell
+# Values: "deterministic" or "claude".
+# Effect: selects how Orchai turns your prompt into tasks. Parallel mode requires "claude".
+$env:ORCHESTRA_PLANNER = "deterministic"
+
+# Values: "" for generated project mode, or a path to an existing git repo.
+# Effect: blank creates a new generated project. A repo path tells Claude where to edit existing code.
+$env:ORCHESTRA_WORKSPACE_PATH = ""
+
+# Values: "0" or "1".
+# Effect: "1" allows uncommitted changes in single-worker existing repo mode. Parallel mode ignores this and requires a clean repo.
+$env:ORCHESTRA_ALLOW_DIRTY_REPO = "0"
+
+# Values: any folder path outside this Orchai source repo.
+# Effect: controls where generated projects are created.
+$env:ORCHESTRA_GENERATED_ROOT = "$HOME\Desktop\Orchestra Projects"
+
+# Values: any folder path outside this Orchai source repo.
+# Effect: controls where JSON run logs are saved.
+$env:ORCHESTRA_RUNS_ROOT = "$HOME\Documents\Orchestra\runs"
+
+# Values: any folder path outside this Orchai source repo.
+# Effect: controls where parallel mode creates worker git worktrees.
+$env:ORCHESTRA_PARALLEL_WORKTREES_ROOT = "$HOME\Documents\Orchestra\worktrees"
+
+# Values: "claude" or the full path to the Claude CLI executable.
+# Effect: tells Orchai which Claude CLI command to run.
+$env:ORCHESTRA_CLAUDE_COMMAND = "claude"
+
+# Values: "" for the Claude CLI default, or a Claude model name accepted by your CLI.
+# Effect: passes the model to the planner with claude --model.
+$env:ORCHESTRA_PLANNER_MODEL = ""
+
+# Values: "" for the Claude CLI default, or a Claude model name accepted by your CLI.
+# Effect: passes the model to Claude workers that edit files.
+$env:ORCHESTRA_WORKER_MODEL = ""
+
+# Values: "" to use ORCHESTRA_WORKER_MODEL, or a Claude model name accepted by your CLI.
+# Effect: chooses the model used when parallel mode resolves rebase conflicts.
+$env:ORCHESTRA_CONFLICT_RESOLVER_MODEL = ""
+
+# Values: "" to skip repo-specific checks, or any shell command such as "npm test" or "pnpm lint".
+# Effect: runs this command inside the selected workspace after edits.
+$env:ORCHESTRA_REVIEW_COMMAND = ""
+
+# Values: any positive number of milliseconds.
+# Effect: sets how long each parallel worker can run before timing out.
+$env:ORCHESTRA_PARALLEL_WORKER_TIMEOUT_MS = "3600000"
+
+# Values: any positive integer.
+# Effect: sets how many times a parallel worker can retry after review feedback.
+$env:ORCHESTRA_MAX_BUILD_ATTEMPTS = "3"
+
+# Values: any git remote name, such as "origin" or "upstream".
+# Effect: chooses the remote used when parallel mode fetches, rebases, and pushes worker branches.
+$env:ORCHESTRA_GIT_REMOTE = "origin"
+```
+
+Then create a small project in a new folder:
+
+```powershell
+npm run dev -- "Build a simple todo app"
+```
+
+Generated projects are written here:
 
 ```txt
 C:\Users\<you>\Desktop\Orchestra Projects\
 ```
 
-Override:
-
-```powershell
-$env:ORCHESTRA_GENERATED_ROOT = "C:\Users\shcar\Desktop\My Orchestra Projects"
-```
-
-For a todo prompt, the current builder creates:
-
-```txt
-C:\Users\<you>\Desktop\Orchestra Projects\simple-todo-app\
-  index.html
-  styles.css
-  app.js
-```
-
-In existing repo mode, files are changed inside the repo selected by `ORCHESTRA_WORKSPACE_PATH`.
-
-## Where Logs Are Saved
-
-Run logs are also saved outside the Orchestra source repo.
-
-Default:
+Run logs are written here:
 
 ```txt
 C:\Users\<you>\Documents\Orchestra\runs\
 ```
 
-Override:
+The terminal summary prints the project path and log path after each run.
+
+## Generated Project Mode
+
+Generated project mode is the default. Orchai creates a new project folder and does not edit any existing repo.
 
 ```powershell
-$env:ORCHESTRA_RUNS_ROOT = "C:\Users\shcar\Documents\Orchestra Runs"
+npm run dev -- "Build a simple todo app"
 ```
 
-`ORCHESTRA_RUNS_ROOT` must be outside the Orchestra source repo.
+Use a different output folder:
 
-The filename includes the run id:
+```powershell
+$env:ORCHESTRA_GENERATED_ROOT = "C:\path\to\generated-projects"
+npm run dev -- "Build a simple todo app"
+```
+
+Runtime folders must be outside this Orchai source repo.
+
+## Existing Repo Mode
+
+Use this when you want Claude to edit a real repo. Claude planning is recommended for real codebases, but the deterministic planner can still be used for a simple two-step plan.
+
+Set the values in [Quick Start](#quick-start), then run:
+
+```powershell
+npm run dev -- "Add input validation to the login form"
+```
+
+What to know:
+
+- `ORCHESTRA_WORKSPACE_PATH` must point to a git repo outside this Orchai source repo.
+- The target repo must have a clean working tree by default.
+- `ORCHESTRA_REVIEW_COMMAND` is optional. If set, it runs inside the target repo after Claude edits files.
+- To allow existing uncommitted changes in single-worker existing repo mode, set `$env:ORCHESTRA_ALLOW_DIRTY_REPO = "1"`.
+
+Return to generated project mode:
+
+```powershell
+Remove-Item Env:ORCHESTRA_WORKSPACE_PATH -ErrorAction SilentlyContinue
+Remove-Item Env:ORCHESTRA_REVIEW_COMMAND -ErrorAction SilentlyContinue
+$env:ORCHESTRA_PLANNER = "deterministic"
+```
+
+## Parallel Mode
+
+Use parallel mode for batches of work that can be split into separate features. The planner decides whether the request should run as one worker, multiple workers, or be blocked because it is not safe to split.
+
+Set the values in [Quick Start](#quick-start), then run:
+
+```powershell
+npm run dev -- --parallel "Refactor auth handling and add API rate limiting"
+```
+
+Example with three independent features:
+
+```powershell
+npm run dev -- --parallel "Add user profile avatars, add CSV export for reports, and add keyboard shortcuts to the dashboard"
+```
+
+Parallel mode:
+
+- Requires a clean base repo. `ORCHESTRA_ALLOW_DIRTY_REPO` is ignored here.
+- Creates one git worktree and one branch per worker.
+- Opens a visible terminal window for each worker.
+- Runs review for each worker.
+- Commits successful worker changes and pushes branches to `origin` by default.
+- Leaves worktrees in place so you can inspect them.
+
+Default parallel worktree location:
 
 ```txt
-C:\Users\<you>\Documents\Orchestra\runs\run_....json
+C:\Users\<you>\Documents\Orchestra\worktrees\
 ```
 
-## How To Debug A Run
+## What The Output Means
 
-After running the project, use the terminal summary to find the project path and log path.
+A normal run ends with a summary like this:
 
-Check the generated files at the project path printed in the terminal:
-
-```bash
-ls "C:\Users\<you>\Desktop\Orchestra Projects\simple-todo-app"
+```txt
+Run complete
+Run ID: run_...
+Planner: claude
+Workspace: existing-repo
+Prompt: Add input validation to the login form
+Project path: C:\path\to\your\repo
+Tasks: 2
+Files changed: 3
+Review passed: true
+Log path: C:\Users\...\Documents\Orchestra\runs\run_....json
 ```
 
-Open the JSON log named in the terminal output. The important events are:
+A parallel run prints an aggregate log path plus one result block per worker. Each worker block includes the branch, worktree path, review result, commit, push result, Claude transcript, and cleanup command.
+
+## Environment Variables
+
+The [Quick Start](#quick-start) setup block lists every `ORCHESTRA_*` value. Use this section to decide what each one should be for your run.
+
+Mode-specific notes:
+
+- **Generated project mode:** leave `ORCHESTRA_WORKSPACE_PATH` blank or remove it so Orchai creates a new project instead of editing an existing repo.
+- **Existing repo mode:** set `ORCHESTRA_WORKSPACE_PATH` to the git repo Claude should edit.
+- **Parallel mode:** set `ORCHESTRA_PLANNER=claude` and `ORCHESTRA_WORKSPACE_PATH` to the base git repo.
+
+What each variable does:
+
+Planner and workspace:
+
+- `ORCHESTRA_PLANNER`: `deterministic` or `claude`; defaults to `deterministic`. Selects the planner. Parallel mode requires `claude`; existing repo mode works best with it.
+- `ORCHESTRA_WORKSPACE_PATH`: path to a git repo; no default. Turns on existing repo mode and tells Orchai which repo Claude should edit. Omit it for generated project mode.
+- `ORCHESTRA_ALLOW_DIRTY_REPO`: `0` or `1`; defaults to `0`. Allows uncommitted changes in single-worker existing repo mode when set to `1`. Parallel mode ignores this and always requires a clean base repo.
+
+Output paths:
+
+- `ORCHESTRA_GENERATED_ROOT`: folder path; defaults to `C:\Users\<you>\Desktop\Orchestra Projects`. Chooses where generated projects are created.
+- `ORCHESTRA_RUNS_ROOT`: folder path; defaults to `C:\Users\<you>\Documents\Orchestra\runs`. Chooses where JSON run logs are saved.
+- `ORCHESTRA_PARALLEL_WORKTREES_ROOT`: folder path; defaults to `C:\Users\<you>\Documents\Orchestra\worktrees`. Chooses where parallel mode creates worker git worktrees.
+
+Claude CLI:
+
+- `ORCHESTRA_CLAUDE_COMMAND`: command or executable path; defaults to `claude`. Points Orchai at the Claude CLI binary. Use this if `claude` is not on your `PATH`.
+- `ORCHESTRA_PLANNER_MODEL`: Claude model name; no default. Passes `--model` to the Claude planner. If omitted, Claude CLI uses its own default.
+- `ORCHESTRA_WORKER_MODEL`: Claude model name; no default. Passes `--model` to Claude worker sessions that edit files.
+- `ORCHESTRA_CONFLICT_RESOLVER_MODEL`: Claude model name; defaults to `ORCHESTRA_WORKER_MODEL`. Chooses the Claude model used when parallel mode asks a worker to resolve rebase conflicts.
+
+Review and parallel behavior:
+
+- `ORCHESTRA_REVIEW_COMMAND`: shell command; no default. Runs a repo-specific check after edits, such as `npm test`, `pnpm lint`, or `npm run mr-check`.
+- `ORCHESTRA_PARALLEL_WORKER_TIMEOUT_MS`: positive number; defaults to `3600000`. Sets the timeout for each parallel worker in milliseconds.
+- `ORCHESTRA_MAX_BUILD_ATTEMPTS`: positive integer; defaults to `3`. Sets how many times a parallel worker can retry after review feedback.
+- `ORCHESTRA_GIT_REMOTE`: git remote name; defaults to `origin`. Chooses the remote used when parallel mode fetches, rebases, and pushes worker branches.
+
+All generated roots, run-log roots, worktree roots, and existing repo paths must be outside this Orchai source repo.
+
+## Debugging
+
+If a run fails, the terminal prints the log path. Open that JSON file and look for these events:
 
 ```txt
 orchestrator.started
@@ -228,41 +256,21 @@ builder.completed
 reviewer.started
 reviewer.completed
 orchestrator.completed
-```
-
-If a run fails after the orchestrator starts, Orchestra still saves a log. The terminal prints:
-
-```txt
-Run failed
-Error: ...
-Log path: C:\Users\<you>\Documents\Orchestra\runs\run_....json
-```
-
-Open that log and look for:
-
-```txt
 orchestrator.failed
 ```
 
-That entry contains a structured error with `name`, `message`, and `stack`.
+Parallel logs also include `parallel.*` events and one child log per worker.
 
-Use those events to answer:
+Useful things to check:
 
-- What prompt started the run?
-- What tasks did the planner create?
-- What files did the builder change?
-- Did the reviewer pass?
-- Did any review command pass or fail?
-- If review failed, what issues were reported?
+- Did `planner.completed` create reasonable tasks?
+- Did `builder.completed` list the files you expected?
+- Did `reviewer.completed` pass?
+- If a review command ran, what exit code did it return?
 - If the run failed, what does `orchestrator.failed.output.error.message` say?
 
-## Debugging Checklist
+## Development
 
-1. Did the terminal print a run id?
-2. Did the printed project path contain the project folder?
-3. Did the printed log path contain the JSON log?
-4. Did `planner.completed` contain reasonable tasks?
-5. Did `builder.completed` list the expected changed files?
-6. Did `reviewer.completed` show `passed: true` or explain why it failed?
-7. For existing repos, did `reviewer.completed.commandsRun` show the expected repo command?
-8. For failed runs, did `orchestrator.failed` record the error?
+```bash
+npm run typecheck
+```
