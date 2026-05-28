@@ -34,7 +34,7 @@ export async function runProcessCommand(input: {
       command: formatCommand(input.command, input.args),
       exitCode: typeof details.code === "number" ? details.code : 1,
       stdout: String(details.stdout ?? ""),
-      stderr: String(details.stderr ?? details.message),
+      stderr: String(details.stderr || details.message || ""),
     };
   }
 }

@@ -61,12 +61,14 @@ async function main(): Promise<void> {
     plannerMode === "claude"
       ? new ClaudeCliLlmClient({
           command: process.env.ORCHESTRA_CLAUDE_COMMAND,
+          model: getOptionalEnv("ORCHESTRA_PLANNER_MODEL"),
         })
       : undefined;
   const existingRepoWorker =
     workspace?.kind === "existing-repo"
       ? new ClaudeCliWorkspaceWorker({
           command: process.env.ORCHESTRA_CLAUDE_COMMAND,
+          model: getOptionalEnv("ORCHESTRA_WORKER_MODEL"),
           allowDirtyRepo: process.env.ORCHESTRA_ALLOW_DIRTY_REPO === "1",
         })
       : undefined;
@@ -144,15 +146,19 @@ async function runParallelMode(input: {
   const logger = new RunLogger(createRunId("parallel_run"), input.runsRoot);
   const llmClient = new ClaudeCliLlmClient({
     command: process.env.ORCHESTRA_CLAUDE_COMMAND,
+    model: getOptionalEnv("ORCHESTRA_PLANNER_MODEL"),
   });
+  const workerModel = getOptionalEnv("ORCHESTRA_WORKER_MODEL");
   const existingRepoWorker = new ClaudeCliWorkspaceWorker({
     command: process.env.ORCHESTRA_CLAUDE_COMMAND,
-    allowDirtyRepo: false,
+    model: workerModel,
+    allowDirtyRepo: true,
     timeoutMs: getParallelWorkerTimeoutMs(),
     openTerminal: true,
   });
   const conflictResolverWorker = new ClaudeCliWorkspaceWorker({
     command: process.env.ORCHESTRA_CLAUDE_COMMAND,
+    model: getOptionalEnv("ORCHESTRA_CONFLICT_RESOLVER_MODEL") ?? workerModel,
     allowDirtyRepo: true,
     timeoutMs: getParallelWorkerTimeoutMs(),
     openTerminal: true,
@@ -206,8 +212,12 @@ function getWorktreesRoot(): string {
 }
 
 function getReviewCommand(): string | undefined {
-  const command = process.env.ORCHESTRA_REVIEW_COMMAND?.trim();
-  return command || undefined;
+  return getOptionalEnv("ORCHESTRA_REVIEW_COMMAND");
+}
+
+function getOptionalEnv(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  return value || undefined;
 }
 
 function getParallelWorkerTimeoutMs(): number {

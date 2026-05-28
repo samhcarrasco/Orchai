@@ -16,8 +16,13 @@ export interface ParallelFeatureRequest {
   targetFiles?: string[];
 }
 
+export type ParallelExecutionDecision = "single_worker" | "parallel" | "blocked";
+
 export interface ParallelPlan {
   projectName: string;
+  decision: ParallelExecutionDecision;
+  decisionReason: string;
+  brief: string;
   baseRepoRoot: string;
   baseBranch: string;
   baseHeadSha: string;
@@ -72,7 +77,6 @@ export interface ParallelPublishResult {
   status: "skipped" | "published" | "failed";
   remoteName: string;
   branchName: string;
-  prUrl?: string;
   error?: SerializedError;
   commandsRun: string[];
 }
@@ -87,6 +91,7 @@ export interface ConflictReport {
 }
 
 export type ParallelRunStatus =
+  | "blocked"
   | "completed"
   | "completed_with_failures"
   | "completed_with_conflicts"

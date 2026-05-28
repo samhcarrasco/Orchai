@@ -82,6 +82,7 @@ export interface BuilderInput {
   tasks: Task[];
   workerDisplayName?: string;
   workerTranscriptPath?: string;
+  workerContextBrief?: string;
 }
 
 export interface BuilderOutput {

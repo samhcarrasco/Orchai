@@ -19,15 +19,17 @@ export class ClaudeCliLlmClient implements LlmClient {
   constructor(
     private readonly options: {
       command?: string;
+      model?: string;
     } = {},
   ) {}
 
   async completeJson<T>(input: CompleteJsonInput): Promise<T> {
     const userPrompt = createStructuredUserPrompt(input);
+    const useSchema = Boolean(input.jsonSchema);
     const args = [
       "--print",
       "--output-format",
-      "text",
+      useSchema ? "json" : "text",
       "--no-session-persistence",
       "--tools",
       "",
@@ -35,8 +37,12 @@ export class ClaudeCliLlmClient implements LlmClient {
       input.systemPrompt,
     ];
 
-    if (input.jsonSchema) {
+    if (useSchema) {
       args.push("--json-schema", JSON.stringify(input.jsonSchema));
+    }
+
+    if (this.options.model) {
+      args.push("--model", this.options.model);
     }
 
     args.push(userPrompt);
@@ -81,13 +87,12 @@ function parseJsonOutput<T>(output: string): T {
 }
 
 function unwrapJsonResult<T>(value: unknown): T {
-  if (
-    value &&
-    typeof value === "object" &&
-    "result" in value &&
-    Object.keys(value).length > 1
-  ) {
-    const result = (value as { result: unknown }).result;
+  if (isRecord(value) && value.type === "result") {
+    if ("structured_output" in value) {
+      return value.structured_output as T;
+    }
+
+    const result = value.result;
 
     if (typeof result === "string") {
       return parseJsonOutput<T>(result);
@@ -97,6 +102,10 @@ function unwrapJsonResult<T>(value: unknown): T {
   }
 
   return value as T;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function createStructuredUserPrompt(input: CompleteJsonInput): string {

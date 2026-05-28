@@ -1,5 +1,8 @@
+import path from "node:path";
+
 import type { LlmClient } from "../core/llmClient";
 import type {
+  ParallelExecutionDecision,
   ParallelFeatureRequest,
   ParallelPlan,
 } from "../core/parallelTypes";
@@ -169,14 +172,25 @@ function createPlannerUserPrompt(input: PlannerInput): string {
     .join("\n");
 }
 
-type ParallelPlannerOutput = Pick<ParallelPlan, "projectName" | "features">;
+type ParallelPlannerOutput = Pick<
+  ParallelPlan,
+  "projectName" | "decision" | "decisionReason" | "brief" | "features"
+>;
 
 function createParallelPlannerSystemPrompt(): string {
   return [
-    "You are the parallel planner agent for Orchestra.",
-    "Split one plain-English batch request for an existing git repo into 2 to 5 independent feature requests.",
-    "Each feature prompt must be standalone, scoped, and suitable for a separate worker in its own git worktree.",
-    "Prefer features that touch different files or clearly separable areas of the codebase.",
+    "You are the scout/planner agent for Orchestra parallel mode.",
+    "Before any worker starts, decide whether the request should run as single_worker, parallel, or blocked.",
+    "Choose single_worker when the work is small, tightly related, likely to touch the same files, or needs shared repo discovery.",
+    "Choose parallel only when the work is meaningfully independent and features are likely to touch disjoint files or clearly separable areas.",
+    "Choose blocked when the request is unsafe, ambiguous, missing essential context, or cannot be handled as repo work.",
+    "For single_worker, return exactly one feature that covers the whole request.",
+    "For parallel, split the request into 2 to 5 independent feature requests.",
+    "For blocked, return no features.",
+    "Write a compact brief that summarizes useful repo/task context for workers in a few short sentences.",
+    "Each feature prompt must be standalone, scoped, and suitable for a worker in its own git worktree.",
+    "Do not include absolute filesystem paths in feature prompts, titles, or targetFiles.",
+    "Refer to the selected repository by name or as the repository; workers receive their own worktree path later.",
     "Do not include merge, rebase, cherry-pick, cleanup, or branch-management instructions.",
     "Return exactly one JSON object matching the provided schema.",
     "Do not include markdown, commentary, bullet lists, or file contents.",
@@ -186,9 +200,10 @@ function createParallelPlannerSystemPrompt(): string {
 
 function createParallelPlannerUserPrompt(input: ParallelPlannerInput): string {
   return [
-    `Base repo root: ${input.baseRepoRoot}`,
+    `Repository name: ${path.basename(input.baseRepoRoot)}`,
     `Base branch: ${input.baseBranch}`,
     `Base HEAD: ${input.baseHeadSha}`,
+    "Do not repeat or infer any absolute filesystem path in the feature prompts.",
     `Batch request: ${input.request.prompt}`,
   ].join("\n");
 }
@@ -244,15 +259,27 @@ const plannerOutputSchema = {
 const parallelPlannerOutputSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["projectName", "features"],
+  required: ["projectName", "decision", "decisionReason", "brief", "features"],
   properties: {
     projectName: {
       type: "string",
       minLength: 1,
     },
+    decision: {
+      type: "string",
+      enum: ["single_worker", "parallel", "blocked"],
+    },
+    decisionReason: {
+      type: "string",
+      minLength: 1,
+    },
+    brief: {
+      type: "string",
+      minLength: 1,
+    },
     features: {
       type: "array",
-      minItems: 2,
+      minItems: 0,
       maxItems: 5,
       items: {
         type: "object",
@@ -330,52 +357,224 @@ function validateParallelPlannerOutput(
     throw new Error(`Invalid parallel planner project name: ${output.projectName}`);
   }
 
-  if (
-    !Array.isArray(output.features) ||
-    output.features.length < 2 ||
-    output.features.length > 5
-  ) {
-    throw new Error("Parallel planner output must include 2 to 5 features.");
+  if (!isParallelExecutionDecision(output.decision)) {
+    throw new Error(`Invalid parallel planner decision: ${output.decision}`);
+  }
+
+  if (!output.decisionReason?.trim()) {
+    throw new Error("Parallel planner output must include a decision reason.");
+  }
+
+  if (!output.brief?.trim()) {
+    throw new Error("Parallel planner output must include a compact brief.");
+  }
+
+  if (!Array.isArray(output.features) || output.features.length > 5) {
+    throw new Error("Parallel planner output must include 0 to 5 features.");
+  }
+
+  const decisionReason = compactPlannerText(
+    scrubBaseRepoPath(output.decisionReason, input.baseRepoRoot),
+    800,
+  );
+  const brief = compactPlannerText(
+    scrubBaseRepoPath(output.brief, input.baseRepoRoot),
+    1_200,
+  );
+
+  if (output.decision === "blocked") {
+    return {
+      projectName: output.projectName,
+      decision: "blocked",
+      decisionReason,
+      brief,
+      baseRepoRoot: input.baseRepoRoot,
+      baseBranch: input.baseBranch,
+      baseHeadSha: input.baseHeadSha,
+      features: [],
+    };
   }
 
   const ids = new Set<string>();
-  const features: ParallelFeatureRequest[] = output.features.map((feature) => {
-    if (!isSafeFeatureId(feature.id)) {
-      throw new Error(`Invalid parallel feature id: ${feature.id}`);
+  const features: ParallelFeatureRequest[] = output.features.map((feature) =>
+    validateParallelFeature(feature, ids, input.baseRepoRoot),
+  );
+
+  if (output.decision === "single_worker") {
+    if (features.length !== 1) {
+      throw new Error("single_worker planner output must include exactly one feature.");
     }
 
-    if (ids.has(feature.id)) {
-      throw new Error(`Duplicate parallel feature id: ${feature.id}`);
-    }
+    return {
+      projectName: output.projectName,
+      decision: "single_worker",
+      decisionReason,
+      brief,
+      baseRepoRoot: input.baseRepoRoot,
+      baseBranch: input.baseBranch,
+      baseHeadSha: input.baseHeadSha,
+      features,
+    };
+  }
 
-    ids.add(feature.id);
+  if (features.length < 2) {
+    throw new Error("parallel planner output must include at least two features.");
+  }
 
-    if (!feature.title || !feature.prompt) {
-      throw new Error("Parallel feature is missing title or prompt.");
-    }
-
-    if (feature.status !== "pending") {
-      throw new Error(`Parallel feature must start as pending: ${feature.id}`);
-    }
-
-    if (feature.targetFiles) {
-      for (const targetFile of feature.targetFiles) {
-        if (!isSafeRelativePath(targetFile)) {
-          throw new Error(`Unsafe parallel target file: ${targetFile}`);
-        }
-      }
-    }
-
-    return feature;
-  });
+  if (hasAmbiguousOrOverlappingTargets(features)) {
+    return {
+      projectName: output.projectName,
+      decision: "single_worker",
+      decisionReason: compactPlannerText(
+        [
+          "Downgraded from parallel because planned target files were missing, broad, or overlapping.",
+          `Planner reason: ${decisionReason}`,
+        ].join(" "),
+        800,
+      ),
+      brief,
+      baseRepoRoot: input.baseRepoRoot,
+      baseBranch: input.baseBranch,
+      baseHeadSha: input.baseHeadSha,
+      features: [
+        {
+          id: "single_worker",
+          title: "Implement requested repo change",
+          prompt: input.request.prompt,
+          status: "pending",
+        },
+      ],
+    };
+  }
 
   return {
     projectName: output.projectName,
+    decision: "parallel",
+    decisionReason,
+    brief,
     baseRepoRoot: input.baseRepoRoot,
     baseBranch: input.baseBranch,
     baseHeadSha: input.baseHeadSha,
     features,
   };
+}
+
+function validateParallelFeature(
+  feature: ParallelFeatureRequest,
+  ids: Set<string>,
+  baseRepoRoot: string,
+): ParallelFeatureRequest {
+  if (!isSafeFeatureId(feature.id)) {
+    throw new Error(`Invalid parallel feature id: ${feature.id}`);
+  }
+
+  if (ids.has(feature.id)) {
+    throw new Error(`Duplicate parallel feature id: ${feature.id}`);
+  }
+
+  ids.add(feature.id);
+
+  if (!feature.title || !feature.prompt) {
+    throw new Error("Parallel feature is missing title or prompt.");
+  }
+
+  if (feature.status !== "pending") {
+    throw new Error(`Parallel feature must start as pending: ${feature.id}`);
+  }
+
+  const targetFiles = feature.targetFiles
+    ? [...new Set(feature.targetFiles.map((targetFile) => targetFile.trim()))]
+    : undefined;
+
+  if (targetFiles) {
+    for (const targetFile of targetFiles) {
+      if (!isSafeRelativePath(targetFile)) {
+        throw new Error(`Unsafe parallel target file: ${targetFile}`);
+      }
+    }
+  }
+
+  return {
+    ...feature,
+    title: compactPlannerText(scrubBaseRepoPath(feature.title, baseRepoRoot), 160),
+    prompt: compactPlannerText(scrubBaseRepoPath(feature.prompt, baseRepoRoot), 4_000),
+    targetFiles,
+  };
+}
+
+function hasAmbiguousOrOverlappingTargets(
+  features: ParallelFeatureRequest[],
+): boolean {
+  const seenTargets: string[] = [];
+
+  for (const feature of features) {
+    const targets = feature.targetFiles?.map(normalizeTargetPath);
+
+    if (!targets?.length || targets.some(isBroadTargetPath)) {
+      return true;
+    }
+
+    for (const target of targets) {
+      if (
+        seenTargets.some(
+          (seenTarget) =>
+            seenTarget === target ||
+            isPathPrefix(seenTarget, target) ||
+            isPathPrefix(target, seenTarget),
+        )
+      ) {
+        return true;
+      }
+
+      seenTargets.push(target);
+    }
+  }
+
+  return false;
+}
+
+function normalizeTargetPath(targetPath: string): string {
+  const forwardSlashed = targetPath.trim().replaceAll("\\", "/");
+  const normalized = path.posix.normalize(forwardSlashed);
+  const cleaned = normalized.replace(/\/+$/g, "").replace(/^\.\//, "");
+  return (cleaned.length > 0 ? cleaned : ".").toLowerCase();
+}
+
+function isBroadTargetPath(targetPath: string): boolean {
+  return [".", "*", "./"].includes(targetPath);
+}
+
+function isPathPrefix(parentPath: string, childPath: string): boolean {
+  return childPath.startsWith(`${parentPath}/`);
+}
+
+function isParallelExecutionDecision(
+  value: string,
+): value is ParallelExecutionDecision {
+  return value === "single_worker" || value === "parallel" || value === "blocked";
+}
+
+function scrubBaseRepoPath(value: string, baseRepoRoot: string): string {
+  const resolvedBaseRepoRoot = path.resolve(baseRepoRoot);
+  const variants = [
+    resolvedBaseRepoRoot,
+    resolvedBaseRepoRoot.replaceAll("\\", "/"),
+    resolvedBaseRepoRoot.replaceAll("/", "\\"),
+  ];
+
+  return [...new Set(variants)].reduce(
+    (scrubbed, variant) =>
+      variant ? scrubbed.split(variant).join("the repository") : scrubbed,
+    value,
+  );
+}
+
+function compactPlannerText(value: string, maxLength: number): string {
+  const compacted = value.replace(/\s+/g, " ").trim();
+
+  return compacted.length > maxLength
+    ? `${compacted.slice(0, Math.max(0, maxLength - 3))}...`
+    : compacted;
 }
 
 function isSafeProjectName(projectName: string): boolean {

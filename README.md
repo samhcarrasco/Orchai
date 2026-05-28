@@ -82,6 +82,16 @@ Claude mode uses the `claude` command already installed and logged in on the mac
 $env:ORCHESTRA_CLAUDE_COMMAND = "C:\path\to\claude.exe"
 ```
 
+Optional model tiers can be configured without hardcoding model names in Orchestra:
+
+```powershell
+$env:ORCHESTRA_PLANNER_MODEL = "haiku"
+$env:ORCHESTRA_WORKER_MODEL = "sonnet"
+$env:ORCHESTRA_CONFLICT_RESOLVER_MODEL = "opus"
+```
+
+These values are passed to Claude CLI as `--model` only when the environment variables are set.
+
 ## Existing Repo Mode
 
 Orchestra can also target an existing git repo. This uses the same orchestration loop, but the workspace is the repo you choose instead of the generated projects folder.
@@ -127,6 +137,18 @@ Remove-Item Env:ORCHESTRA_WORKSPACE_PATH
 Remove-Item Env:ORCHESTRA_REVIEW_COMMAND
 $env:ORCHESTRA_PLANNER = "deterministic"
 ```
+
+## Parallel Mode
+
+Parallel mode uses a cheap scout/planner decision before any worker terminals start. The planner chooses `single_worker`, `parallel`, or `blocked`; small or tightly related requests run as one worker, and multiple workers are only started for meaningfully independent work.
+
+```powershell
+$env:ORCHESTRA_PLANNER = "claude"
+$env:ORCHESTRA_WORKSPACE_PATH = "C:\path\to\your\repo"
+npm run dev -- --parallel "Make the requested batch of changes"
+```
+
+The planner also produces a compact brief that is passed into worker prompts so each worker has useful context without rediscovering everything from scratch.
 
 ## Typecheck
 

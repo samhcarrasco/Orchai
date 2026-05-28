@@ -23,6 +23,7 @@ export class BuilderAgent {
         workspace: input.projectState.workspace,
         displayName: input.workerDisplayName,
         transcriptPath: input.workerTranscriptPath,
+        contextBrief: input.workerContextBrief,
       });
     }
 

@@ -3,7 +3,6 @@ import { BuilderAgent } from "./agents/builderAgent";
 import { PlannerAgent } from "./agents/plannerAgent";
 import { ReviewerAgent } from "./agents/reviewerAgent";
 import { OrchestratorRunError, serializeError } from "./orchestrator";
-import { runProcessCommand } from "./core/commandRunner";
 import { createExistingRepoWorkspace } from "./core/fileSystem";
 import {
   getCurrentBranch,
@@ -28,6 +27,7 @@ import type { LlmClient } from "./core/llmClient";
 import { RunLogger } from "./core/logger";
 import type {
   ConflictReport,
+  ParallelFeatureRequest,
   ParallelPlan,
   ParallelRunResult,
   ParallelRunStatus,
@@ -108,6 +108,43 @@ export async function runParallelOrchestrator(
       event: "parallel.planner.completed",
       output: plan,
     });
+
+    logger.log({
+      agent: "planner",
+      event: "parallel.scout_decision.completed",
+      output: {
+        decision: plan.decision,
+        decisionReason: plan.decisionReason,
+        brief: plan.brief,
+        featureCount: plan.features.length,
+      },
+    });
+
+    if (plan.decision === "blocked") {
+      const result: ParallelRunResult = {
+        runId: logger.runId,
+        status: "blocked",
+        plan,
+        workers: [],
+        conflictReport: createConflictReport([]),
+      };
+
+      logger.log({
+        agent: "parallel-orchestrator",
+        event: "parallel.completed",
+        output: result,
+      });
+
+      const logPath = await logger.save();
+      result.aggregateLogPath = logPath;
+
+      printParallelReport({
+        request,
+        result,
+        logPath,
+      });
+      return;
+    }
 
     const specs = await createAndValidateWorktreeSpecs({
       plan,
@@ -338,13 +375,18 @@ function createInitialWorkerRuns(input: {
   specs: Map<string, GitWorktreeSpec>;
   parallelRunId: string;
 }): ParallelWorkerRun[] {
-  return input.plan.features.map((feature, index) => {
-    const spec = input.specs.get(feature.id);
+  return input.plan.features.map((plannedFeature, index) => {
+    const spec = input.specs.get(plannedFeature.id);
 
     if (!spec) {
-      throw new Error(`Missing worktree spec for feature: ${feature.id}`);
+      throw new Error(`Missing worktree spec for feature: ${plannedFeature.id}`);
     }
 
+    const feature = createWorktreeScopedFeature({
+      feature: plannedFeature,
+      baseRepoRoot: input.plan.baseRepoRoot,
+      worktreePath: spec.worktreePath,
+    });
     const workerId = `${input.parallelRunId}_${String(index + 1).padStart(2, "0")}_${feature.id}`;
 
     return {
@@ -361,6 +403,52 @@ function createInitialWorkerRuns(input: {
       }),
     };
   });
+}
+
+function createWorktreeScopedFeature(input: {
+  feature: ParallelFeatureRequest;
+  baseRepoRoot: string;
+  worktreePath: string;
+}): ParallelFeatureRequest {
+  const prompt = scrubBaseRepoPath(input.feature.prompt, input.baseRepoRoot);
+
+  return {
+    ...input.feature,
+    prompt: [
+      "Work only inside this feature worktree.",
+      `Feature worktree root: ${input.worktreePath}`,
+      "If any instruction mentions the base repository checkout or another absolute path, apply the instruction to this worktree instead.",
+      "Do not inspect, edit, create files in, or run commands against any other checkout of this repository.",
+      "",
+      prompt,
+    ].join("\n"),
+  };
+}
+
+function scrubBaseRepoPath(value: string, baseRepoRoot: string): string {
+  const resolvedBaseRepoRoot = path.resolve(baseRepoRoot);
+  const variants = [
+    resolvedBaseRepoRoot,
+    resolvedBaseRepoRoot.replaceAll("\\", "/"),
+    resolvedBaseRepoRoot.replaceAll("/", "\\"),
+  ];
+
+  return [...new Set(variants)].reduce(
+    (scrubbed, variant) =>
+      variant ? scrubbed.split(variant).join("the current worktree") : scrubbed,
+    value,
+  );
+}
+
+function createWorkerContextBrief(input: { plan: ParallelPlan }): string {
+  return scrubBaseRepoPath(
+    [
+      `Planner decision: ${input.plan.decision}.`,
+      `Reason: ${input.plan.decisionReason}`,
+      `Brief: ${input.plan.brief}`,
+    ].join("\n"),
+    input.plan.baseRepoRoot,
+  );
 }
 
 async function runParallelWorker(input: {
@@ -444,6 +532,9 @@ async function runParallelWorker(input: {
           transcriptDir,
           `${input.worker.workerId}.attempt-${attempt}.claude.log`,
         ),
+        workerContextBrief: createWorkerContextBrief({
+          plan: input.plan,
+        }),
       });
       projectState.files = buildResult.filesChanged;
 
@@ -1009,65 +1100,10 @@ async function publishWorkerBranch(input: {
     };
   }
 
-  const existingPrResult = await runProcessCommand({
-    command: "gh",
-    args: [
-      "pr",
-      "view",
-      "--head",
-      input.worker.branchName,
-      "--json",
-      "url",
-      "--jq",
-      ".url",
-    ],
-    cwd: input.worker.worktreePath,
-  });
-  commandsRun.push(existingPrResult.command);
-
-  if (existingPrResult.exitCode === 0 && existingPrResult.stdout.trim()) {
-    return {
-      status: "published",
-      remoteName,
-      branchName: input.worker.branchName,
-      prUrl: existingPrResult.stdout.trim(),
-      commandsRun,
-    };
-  }
-
-  const createPrResult = await runProcessCommand({
-    command: "gh",
-    args: [
-      "pr",
-      "create",
-      "--base",
-      input.plan.baseBranch,
-      "--head",
-      input.worker.branchName,
-      "--title",
-      input.worker.feature.title,
-      "--body",
-      createPullRequestBody(input.worker),
-    ],
-    cwd: input.worker.worktreePath,
-  });
-  commandsRun.push(createPrResult.command);
-
-  if (createPrResult.exitCode !== 0) {
-    return {
-      status: "failed",
-      remoteName,
-      branchName: input.worker.branchName,
-      error: serializeCommandFailure(createPrResult),
-      commandsRun,
-    };
-  }
-
   return {
     status: "published",
     remoteName,
     branchName: input.worker.branchName,
-    prUrl: extractPullRequestUrl(createPrResult.stdout),
     commandsRun,
   };
 }
@@ -1146,8 +1182,19 @@ function printParallelReport(input: {
   console.log(
     `Base branch/HEAD: ${input.result.plan.baseBranch} @ ${input.result.plan.baseHeadSha}`,
   );
+  console.log(`Decision: ${input.result.plan.decision}`);
+  console.log(`Decision reason: ${input.result.plan.decisionReason}`);
   console.log(`Prompt: ${input.request.prompt}`);
   console.log(`Aggregate log path: ${input.logPath}`);
+
+  if (input.result.plan.decision === "blocked") {
+    console.log("No workers were started.");
+    console.log(`Planner brief: ${input.result.plan.brief}`);
+    console.log("Next steps:");
+    console.log("- Adjust the request and run parallel mode again.");
+    return;
+  }
+
   console.log("Feature results:");
 
   for (const worker of input.result.workers) {
@@ -1171,10 +1218,14 @@ function printParallelReport(input: {
     if (worker.rebaseResult) {
       console.log(`  Rebase: ${worker.rebaseResult.status}`);
     }
-    if (worker.publishResult?.prUrl) {
-      console.log(`  PR: ${worker.publishResult.prUrl}`);
-    } else if (worker.publishResult) {
-      console.log(`  Publish: ${worker.publishResult.status}`);
+    if (worker.publishResult) {
+      if (worker.publishResult.status === "published") {
+        console.log(
+          `  Pushed branch: ${worker.publishResult.remoteName}/${worker.publishResult.branchName}`,
+        );
+      } else {
+        console.log(`  Publish: ${worker.publishResult.status}`);
+      }
     }
     if (worker.buildResult?.transcriptPath) {
       console.log(`  Claude transcript: ${worker.buildResult.transcriptPath}`);
@@ -1197,8 +1248,12 @@ function printParallelReport(input: {
   }
 
   console.log("Next steps:");
-  console.log("- Inspect each PR/worktree and review the committed feature diff.");
-  console.log("- Humans should merge approved PRs into the base branch.");
+  console.log(
+    "- Inspect each pushed branch/worktree and review the committed feature diff.",
+  );
+  console.log(
+    "- Open a pull request from each pushed branch to merge it into the base branch.",
+  );
   console.log("- Remove worktrees manually when you are done with them.");
 }
 
@@ -1255,21 +1310,6 @@ function createConflictResolverPrompt(input: {
   ].join("\n");
 }
 
-function createPullRequestBody(worker: ParallelWorkerRun): string {
-  return [
-    "Generated by Orchestra parallel mode.",
-    "",
-    `Worker ID: ${worker.workerId}`,
-    `Feature ID: ${worker.feature.id}`,
-    "",
-    "Prompt:",
-    worker.feature.prompt,
-    "",
-    "Review:",
-    worker.reviewPassed ? "Passed" : "Not passed",
-  ].join("\n");
-}
-
 function collectConflictPaths(status: string): string[] {
   return status
     .split(/\r?\n/)
@@ -1283,12 +1323,6 @@ function collectConflictPaths(status: string): string[] {
       const renamedPath = pathText.split(" -> ").at(-1) ?? pathText;
       return stripQuotes(renamedPath).replaceAll("\\", "/");
     });
-}
-
-function extractPullRequestUrl(stdout: string): string | undefined {
-  return stdout
-    .split(/\s+/)
-    .find((part) => /^https?:\/\/\S+\/pull\/\d+/.test(part));
 }
 
 function getRemoteName(): string {
